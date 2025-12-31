@@ -1,0 +1,46 @@
+version: 1
+project:
+  title: "FusionGAN: Multi-Source Adversarial Synthesis for Survey Data Fusion"
+  description: |
+    A multi-discriminator GAN architecture for learning joint distributions
+    from multiple survey data sources with different variable subsets.
+  keywords:
+    - synthetic data
+    - GANs
+    - data fusion
+    - survey data
+    - statistical matching
+  authors:
+    - name: Max Ghenis
+      email: max@policyengine.org
+      orcid: 0000-0002-8689-8057
+      affiliations:
+        - PolicyEngine
+        - Cosilico
+  github: https://github.com/CosilicoAI/fusiongan
+  license: MIT
+  exports:
+    - format: pdf
+      template: plain_latex
+      output: exports/fusiongan.pdf
+  toc:
+    - file: index.md
+    - file: simulations.md
+    - file: appendix.md
+  bibliography:
+    - references.bib
+site:
+  template: book-theme
+  title: FusionGAN
+  options:
+    logo: _static/logo.png
+    favicon: _static/favicon.ico
+  nav:
+    - title: Paper
+      url: /
+    - title: Simulations
+      url: /simulations
+    - title: Interactive Demo
+      url: /app/
+    - title: GitHub
+      url: https://github.com/CosilicoAI/fusiongan

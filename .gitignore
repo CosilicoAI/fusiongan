@@ -38,3 +38,4 @@ htmlcov/
 
 # uv
 .uv/
+experiments/.cache/

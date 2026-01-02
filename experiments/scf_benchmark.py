@@ -229,6 +229,68 @@ def create_artificial_surveys(
     return survey_a, survey_b, holdout
 
 
+def compute_prdc(
+    real: np.ndarray,
+    fake: np.ndarray,
+    k: int = 5,
+) -> Dict[str, float]:
+    """Compute Precision, Recall, Density, Coverage (PRDC) metrics.
+
+    Standard metrics from "Reliable Fidelity and Diversity Metrics for
+    Generative Models" (Naeem et al., 2020). Used by synthcity.
+
+    Args:
+        real: Real data array (n_real, n_features)
+        fake: Synthetic data array (n_fake, n_features)
+        k: Number of neighbors for radius estimation
+
+    Returns:
+        Dict with precision, recall, density, coverage (all 0-1, higher = better)
+    """
+    from sklearn.neighbors import NearestNeighbors
+
+    # Compute k-NN distances within each set to establish "radius"
+    nn_real = NearestNeighbors(n_neighbors=k + 1, metric="euclidean").fit(real)
+    real_distances, _ = nn_real.kneighbors(real)
+    real_radii = real_distances[:, -1]  # k-th neighbor distance
+
+    nn_fake = NearestNeighbors(n_neighbors=k + 1, metric="euclidean").fit(fake)
+    fake_distances, _ = nn_fake.kneighbors(fake)
+    fake_radii = fake_distances[:, -1]
+
+    # Distance from each fake point to nearest real
+    dist_fake_to_real, _ = nn_real.kneighbors(fake)
+    dist_fake_to_real = dist_fake_to_real[:, 0]  # Nearest only
+
+    # Distance from each real point to nearest fake
+    nn_fake_1 = NearestNeighbors(n_neighbors=1, metric="euclidean").fit(fake)
+    dist_real_to_fake, _ = nn_fake_1.kneighbors(real)
+    dist_real_to_fake = dist_real_to_fake[:, 0]
+
+    # For each fake sample, find the nearest real and check if within that real's radius
+    nearest_real_idx = nn_real.kneighbors(fake, n_neighbors=1, return_distance=False)[:, 0]
+    precision = (dist_fake_to_real <= real_radii[nearest_real_idx]).mean()
+
+    # For each real sample, find the nearest fake and check if within that fake's radius
+    nearest_fake_idx = nn_fake.kneighbors(real, n_neighbors=1, return_distance=False)[:, 0]
+    recall = (dist_real_to_fake <= fake_radii[nearest_fake_idx]).mean()
+
+    # Coverage: fraction of real samples with a nearby fake sample (within real's own radius)
+    coverage = (dist_real_to_fake <= real_radii).mean()
+
+    # Density: for each fake sample, count how many real samples have it within their radius
+    # Then average and normalize by k
+    dist_fake_to_all_real = nn_real.kneighbors(fake, n_neighbors=len(real), return_distance=True)[0]
+    density = (dist_fake_to_all_real <= real_radii).sum(axis=1).mean() / k
+
+    return {
+        "precision": float(precision),
+        "recall": float(recall),
+        "density": float(density),
+        "coverage": float(coverage),
+    }
+
+
 def compute_record_realism_metrics(
     synthetic: pd.DataFrame,
     holdout: pd.DataFrame,
@@ -236,9 +298,7 @@ def compute_record_realism_metrics(
 ) -> Dict[str, float]:
     """Compute record-level realism metrics.
 
-    These metrics evaluate whether synthetic records look like they could
-    have come from the real population. Aggregate statistics (correlations,
-    totals) are handled separately by calibration.
+    Uses PRDC (Precision, Recall, Density, Coverage) plus mean distances.
 
     Args:
         synthetic: Generated synthetic data.
@@ -246,13 +306,7 @@ def compute_record_realism_metrics(
         k: Number of neighbors for k-NN metrics.
 
     Returns:
-        Dict with:
-            - coverage: Mean distance from holdout to nearest synthetic
-                       (lower = synthetic covers real distribution)
-            - authenticity: Mean distance from synthetic to nearest holdout
-                           (lower = synthetic records look real, not mode-collapsed)
-            - density_ratio: Ratio of authenticity to coverage
-                            (close to 1.0 = balanced quality)
+        Dict with PRDC metrics plus mean distances.
     """
     from sklearn.neighbors import NearestNeighbors
 
@@ -261,25 +315,22 @@ def compute_record_realism_metrics(
     synth_vals = synthetic[common_cols].values
     hold_vals = holdout[common_cols].values
 
-    # Coverage: for each holdout record, find distance to nearest synthetic
-    nn_synth = NearestNeighbors(n_neighbors=min(k, len(synth_vals)), metric="euclidean")
-    nn_synth.fit(synth_vals)
-    distances_to_synth, _ = nn_synth.kneighbors(hold_vals)
-    coverage = distances_to_synth[:, 0].mean()  # Distance to nearest
+    # PRDC metrics (standard, 0-1 scale, higher = better)
+    prdc = compute_prdc(hold_vals, synth_vals, k=k)
 
-    # Authenticity: for each synthetic record, find distance to nearest holdout
-    nn_hold = NearestNeighbors(n_neighbors=min(k, len(hold_vals)), metric="euclidean")
-    nn_hold.fit(hold_vals)
-    distances_to_hold, _ = nn_hold.kneighbors(synth_vals)
-    authenticity = distances_to_hold[:, 0].mean()  # Distance to nearest
+    # Also compute mean distances (for interpretability)
+    nn_synth = NearestNeighbors(n_neighbors=1, metric="euclidean").fit(synth_vals)
+    dist_to_synth, _ = nn_synth.kneighbors(hold_vals)
+    mean_dist_to_synth = dist_to_synth[:, 0].mean()
 
-    # Density ratio: balanced if close to 1.0
-    density_ratio = authenticity / (coverage + 1e-8)
+    nn_hold = NearestNeighbors(n_neighbors=1, metric="euclidean").fit(hold_vals)
+    dist_to_hold, _ = nn_hold.kneighbors(synth_vals)
+    mean_dist_to_hold = dist_to_hold[:, 0].mean()
 
     return {
-        "coverage": coverage,
-        "authenticity": authenticity,
-        "density_ratio": density_ratio,
+        **prdc,
+        "mean_dist_real_to_synth": mean_dist_to_synth,
+        "mean_dist_synth_to_real": mean_dist_to_hold,
     }
 
 
@@ -287,22 +338,25 @@ def compute_record_realism_metrics(
 class BenchmarkResults:
     """Results from SCF benchmark experiment.
 
-    Focus is on record-level realism, not aggregate statistics.
-    Correlations and totals are handled by calibration downstream.
+    Uses PRDC metrics (Precision, Recall, Density, Coverage) which are
+    standard in synthetic data evaluation (Naeem et al., 2020).
     """
 
-    # Per-source metrics (projected to each survey's columns)
-    per_source_coverage: Dict[str, float]
+    # PRDC metrics (0-1 scale, higher = better)
+    precision: float    # Fraction of synthetic within real manifold
+    recall: float       # Fraction of real within synthetic manifold
+    density: float      # How densely synthetic clusters around real
+    coverage: float     # Fraction of real with nearby synthetic (KEY METRIC)
+
+    # Mean distances (for interpretability)
+    mean_dist_real_to_synth: float
+    mean_dist_synth_to_real: float
+
+    # Per-source discriminator accuracy
     per_source_disc_acc: Dict[str, float]
 
-    # Full-record realism (comparing complete synthetic to holdout)
-    coverage: float          # Mean NN dist from holdout → synthetic
-    authenticity: float      # Mean NN dist from synthetic → holdout
-    density_ratio: float     # authenticity / coverage (ideal ≈ 1.0)
-
     # Data sizes
-    n_survey_a: int
-    n_survey_b: int
+    n_train: int
     n_holdout: int
     n_synthetic: int
 
@@ -310,25 +364,26 @@ class BenchmarkResults:
         """Return human-readable summary."""
         lines = [
             "SCF Benchmark Results",
-            "=" * 50,
-            f"Survey A: {self.n_survey_a:,} records",
-            f"Survey B: {self.n_survey_b:,} records",
-            f"Holdout: {self.n_holdout:,} records (ground truth)",
-            f"Synthetic: {self.n_synthetic:,} records",
+            "=" * 55,
+            f"Training: {self.n_train:,} | Holdout: {self.n_holdout:,} | Synthetic: {self.n_synthetic:,}",
             "",
-            "Record-Level Realism (lower distance = better):",
-            f"  Coverage:     {self.coverage:.4f}  (holdout → synth)",
-            f"  Authenticity: {self.authenticity:.4f}  (synth → holdout)",
-            f"  Density Ratio: {self.density_ratio:.2f}  (ideal ≈ 1.0)",
+            "PRDC Metrics (0-1, higher = better):",
+            f"  Coverage:  {self.coverage:.1%}  ← KEY: fraction of real covered by synthetic",
+            f"  Precision: {self.precision:.1%}  (synthetic within real manifold)",
+            f"  Recall:    {self.recall:.1%}  (real within synthetic manifold)",
+            f"  Density:   {self.density:.2f}",
             "",
-            "Per-Source Discriminator Accuracy (ideal = 50%):",
+            "Mean Distances (lower = better):",
+            f"  Real → Synth: {self.mean_dist_real_to_synth:.4f}",
+            f"  Synth → Real: {self.mean_dist_synth_to_real:.4f}",
         ]
 
-        for source in self.per_source_disc_acc:
-            acc = self.per_source_disc_acc[source]
-            # 50% = generator fools discriminator completely
-            quality = "✓" if 0.45 <= acc <= 0.55 else "○" if 0.4 <= acc <= 0.6 else "✗"
-            lines.append(f"  {source}: {acc:.1%} {quality}")
+        if self.per_source_disc_acc:
+            lines.append("")
+            lines.append("Discriminator Accuracy (ideal = 50%):")
+            for source, acc in self.per_source_disc_acc.items():
+                quality = "✓" if 0.45 <= acc <= 0.55 else "○" if 0.4 <= acc <= 0.6 else "✗"
+                lines.append(f"  {source}: {acc:.1%} {quality}")
 
         return "\n".join(lines)
 
@@ -379,31 +434,33 @@ def run_benchmark(config: Optional[SCFBenchmarkConfig] = None) -> BenchmarkResul
     print(f"Generating {n_synthetic:,} synthetic records...")
     synthetic = synth.generate(n=n_synthetic, seed=config.seed)
 
-    # Evaluate per-source metrics (projected to each survey's columns)
-    print("Evaluating record-level realism...")
+    # Evaluate per-source discriminator accuracy
+    print("Evaluating record-level realism (PRDC metrics)...")
     eval_metrics = synth.evaluate()
-    per_source_coverage = {k: v["coverage"] for k, v in eval_metrics.items()}
     per_source_disc_acc = {k: v["discriminator_accuracy"] for k, v in eval_metrics.items()}
 
-    # Evaluate full-record realism against holdout
-    # This is the key metric: do complete synthetic records look real?
+    # Evaluate full-record realism against holdout using PRDC
     all_cols = list(set(config.survey_a_cols) | set(config.survey_b_cols))
     holdout_subset = holdout[all_cols]
 
-    realism_metrics = compute_record_realism_metrics(
+    metrics = compute_record_realism_metrics(
         synthetic=synthetic,
         holdout=holdout_subset,
         k=5,
     )
 
+    # Get training size for context
+    n_train = len(survey_a) + len(survey_b)
+
     results = BenchmarkResults(
-        per_source_coverage=per_source_coverage,
+        precision=metrics["precision"],
+        recall=metrics["recall"],
+        density=metrics["density"],
+        coverage=metrics["coverage"],
+        mean_dist_real_to_synth=metrics["mean_dist_real_to_synth"],
+        mean_dist_synth_to_real=metrics["mean_dist_synth_to_real"],
         per_source_disc_acc=per_source_disc_acc,
-        coverage=realism_metrics["coverage"],
-        authenticity=realism_metrics["authenticity"],
-        density_ratio=realism_metrics["density_ratio"],
-        n_survey_a=len(survey_a),
-        n_survey_b=len(survey_b),
+        n_train=n_train,
         n_holdout=len(holdout),
         n_synthetic=n_synthetic,
     )

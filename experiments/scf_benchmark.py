@@ -41,11 +41,23 @@ class SCFBenchmarkConfig:
     year: int = 2022
 
     # Survey splits - which columns each artificial survey observes
-    survey_a_cols: Tuple[str, ...] = ("age", "educ", "income", "wageinc")
-    survey_b_cols: Tuple[str, ...] = ("wageinc", "asset", "networth", "debt")
+    # Survey A: Demographics + income sources (like CPS) - 10 columns
+    survey_a_cols: Tuple[str, ...] = (
+        "age", "educ", "married", "kids",  # Demographics
+        "income", "wageinc", "ssretinc", "transfothinc", "intdivinc",  # Income sources
+        "bussefarminc",  # Business income (shared with B)
+    )
+    # Survey B: Wealth + debt components (like PUF/SCF) - 16 columns
+    survey_b_cols: Tuple[str, ...] = (
+        "bussefarminc", "intdivinc",  # Shared income
+        "asset", "networth", "debt",  # Summary wealth
+        "fin", "nfin", "houses", "stocks", "checking",  # Asset components
+        "thrift", "cashli", "bond",  # More assets
+        "ccbal", "mrthel", "veh_inst", "edn_inst",  # Debt components
+    )
 
     # Shared column(s) that appear in both surveys
-    shared_cols: Tuple[str, ...] = ("wageinc",)
+    shared_cols: Tuple[str, ...] = ("bussefarminc", "intdivinc")
 
     # Sampling
     sample_frac_a: float = 0.5  # Fraction of population in survey A
@@ -135,18 +147,43 @@ def load_scf(year: int = 2022, seed: int = 42) -> pd.DataFrame:
     # Key variables from SCF summary extract
     # See: https://www.federalreserve.gov/econres/files/codebk2022.txt
     var_map = {
-        "AGE": "age",           # Age of reference person
-        "EDCL": "educ",         # Education level (1-4)
-        "INCOME": "income",     # Total income
-        "WAGEINC": "wageinc",   # Wage and salary income
-        "ASSET": "asset",       # Total assets
-        "NETWORTH": "networth", # Net worth
-        "DEBT": "debt",         # Total debt
-        "HOUSES": "houses",     # Value of primary residence
-        "STOCKS": "stocks",     # Direct stock holdings
-        "NFIN": "nfin",         # Non-financial assets
-        "FIN": "fin",           # Financial assets
-        "WGT": "weight",        # Survey weight
+        # Demographics
+        "AGE": "age",             # Age of reference person
+        "EDCL": "educ",           # Education level (1-4)
+        "MARRIED": "married",     # Marital status
+        "KIDS": "kids",           # Number of children
+
+        # Income sources
+        "INCOME": "income",       # Total income
+        "WAGEINC": "wageinc",     # Wage and salary income
+        "SSRETINC": "ssretinc",   # Social Security income
+        "TRANSFOTHINC": "transfothinc",  # Other transfer income
+        "INTDIVINC": "intdivinc", # Interest/dividend income
+        "BUSSEFARMINC": "bussefarminc",  # Business/farm income
+
+        # Wealth summary
+        "ASSET": "asset",         # Total assets
+        "NETWORTH": "networth",   # Net worth
+        "DEBT": "debt",           # Total debt
+        "FIN": "fin",             # Financial assets
+        "NFIN": "nfin",           # Non-financial assets
+
+        # Asset components
+        "HOUSES": "houses",       # Primary residence value
+        "STOCKS": "stocks",       # Direct stock holdings
+        "CHECKING": "checking",   # Checking account balance
+        "THRIFT": "thrift",       # Thrift/retirement accounts
+        "CASHLI": "cashli",       # Cash value life insurance
+        "BOND": "bond",           # Bond holdings
+
+        # Debt components
+        "CCBAL": "ccbal",         # Credit card balance
+        "MRTHEL": "mrthel",       # Mortgage on primary residence
+        "VEH_INST": "veh_inst",   # Vehicle loans
+        "EDN_INST": "edn_inst",   # Education loans
+
+        # Weight
+        "WGT": "weight",          # Survey weight
     }
 
     # Find columns (case-insensitive)
@@ -158,15 +195,26 @@ def load_scf(year: int = 2022, seed: int = 42) -> pd.DataFrame:
 
     df = df[list(selected.keys())].rename(columns=selected)
 
-    # Clean: replace negative values with 0 for wealth variables
-    for col in ["asset", "networth", "houses", "stocks", "nfin", "fin"]:
+    # Clean: replace negative values with 0 for wealth/income variables
+    wealth_cols = [
+        "asset", "networth", "houses", "stocks", "nfin", "fin",
+        "checking", "thrift", "cashli", "bond",
+    ]
+    income_cols = [
+        "income", "wageinc", "ssretinc", "transfothinc", "intdivinc", "bussefarminc",
+    ]
+    debt_cols = ["debt", "ccbal", "mrthel", "veh_inst", "edn_inst"]
+
+    for col in wealth_cols + income_cols + debt_cols:
         if col in df.columns:
             df[col] = df[col].clip(lower=0)
 
     # Log-transform skewed variables for better GAN training
-    for col in ["income", "wageinc", "asset", "networth", "debt", "houses", "stocks"]:
+    # (skip log transform for small-magnitude variables like demographics)
+    log_transform_cols = wealth_cols + income_cols + debt_cols
+    for col in log_transform_cols:
         if col in df.columns:
-            df[f"{col}_log"] = np.log1p(df[col].clip(lower=0))
+            df[f"{col}_log"] = np.log1p(df[col])
 
     # Standardize all numeric columns for GAN training
     numeric_cols = df.select_dtypes(include=[np.number]).columns

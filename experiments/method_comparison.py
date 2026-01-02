@@ -164,6 +164,9 @@ def run_zero_inflated_qrf(
 
     Stage 1: Classify zero vs non-zero
     Stage 2: QRF on non-zero values only
+
+    Note: Data is standardized, so we detect zeros by finding the minimum
+    (which corresponds to original zero after (0 - mean) / std transformation).
     """
     from sklearn.ensemble import RandomForestClassifier
 
@@ -180,23 +183,44 @@ def run_zero_inflated_qrf(
     survey_a_complete = survey_a.copy()
     survey_b_complete = survey_b.copy()
 
-    def impute_zero_inflated_col(X_train, y_train, X_pred):
-        """Two-stage zero-inflated imputation for a single column."""
+    def impute_zero_inflated_col(X_train, y_train, X_pred, zero_inflation_threshold=0.1):
+        """Two-stage zero-inflated imputation for a single column.
+
+        Since data is standardized, we detect zeros by:
+        1. Finding the minimum value (which corresponds to original zeros)
+        2. Checking if enough records have that minimum value (zero-inflated)
+        """
         results = np.zeros(len(X_pred))
 
-        # Stage 1: Classify zero vs non-zero
-        is_nonzero = (y_train != 0).astype(int)
+        # Detect zeros in standardized data:
+        # Original zeros become the minimum value after standardization
+        min_val = y_train.min()
+        # Check if this is truly zero-inflated (many values at minimum)
+        at_min = np.isclose(y_train, min_val, atol=1e-6)
+        zero_frac = at_min.sum() / len(y_train)
+
+        if zero_frac < zero_inflation_threshold:
+            # Not zero-inflated enough, use standard QRF
+            qrf = RandomForestQuantileRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+            qrf.fit(X_train, y_train)
+            return qrf.predict(X_pred, quantiles=0.5).flatten()
+
+        # Zero-inflated: use two-stage model
+        is_nonzero = (~at_min).astype(int)
 
         if is_nonzero.sum() < 10:
-            # Too few non-zero, just predict zeros
-            return results
+            # Too few non-zero, predict all at minimum (zeros)
+            return np.full(len(X_pred), min_val)
 
+        # Stage 1: Classify zero vs non-zero
         clf = RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=-1)
         clf.fit(X_train, is_nonzero)
         pred_nonzero = clf.predict(X_pred)
 
         # Stage 2: QRF on non-zero values
-        nonzero_mask = y_train != 0
+        nonzero_mask = ~at_min
+        results.fill(min_val)  # Default to standardized zero
+
         if nonzero_mask.sum() > 10:
             qrf = RandomForestQuantileRegressor(n_estimators=100, random_state=42, n_jobs=-1)
             qrf.fit(X_train[nonzero_mask], y_train[nonzero_mask])
@@ -208,6 +232,8 @@ def run_zero_inflated_qrf(
 
         return results
 
+    zero_inflated_count = 0
+
     # Impute B columns onto A records
     for col in b_only_cols:
         preds = impute_zero_inflated_col(
@@ -215,6 +241,11 @@ def run_zero_inflated_qrf(
             survey_b[col].values,
             survey_a[shared_cols].values,
         )
+        # Track if this column was treated as zero-inflated
+        min_val = survey_b[col].values.min()
+        at_min = np.isclose(survey_b[col].values, min_val, atol=1e-6)
+        if at_min.sum() / len(survey_b) >= 0.1:
+            zero_inflated_count += 1
         survey_a_complete[col] = preds
 
     # Impute A columns onto B records
@@ -224,7 +255,13 @@ def run_zero_inflated_qrf(
             survey_a[col].values,
             survey_b[shared_cols].values,
         )
+        min_val = survey_a[col].values.min()
+        at_min = np.isclose(survey_a[col].values, min_val, atol=1e-6)
+        if at_min.sum() / len(survey_a) >= 0.1:
+            zero_inflated_count += 1
         survey_b_complete[col] = preds
+
+    print(f"  (ZI-QRF used two-stage model for {zero_inflated_count} zero-inflated columns)")
 
     # Combine
     synthetic = pd.concat([survey_a_complete, survey_b_complete], ignore_index=True)

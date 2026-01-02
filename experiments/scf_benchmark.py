@@ -41,23 +41,47 @@ class SCFBenchmarkConfig:
     year: int = 2022
 
     # Survey splits - which columns each artificial survey observes
-    # Survey A: Demographics + income sources (like CPS) - 10 columns
+    # Survey A: Demographics + income sources (like CPS) - 18 columns
     survey_a_cols: Tuple[str, ...] = (
-        "age", "educ", "married", "kids",  # Demographics
-        "income", "wageinc", "ssretinc", "transfothinc", "intdivinc",  # Income sources
-        "bussefarminc",  # Business income (shared with B)
+        # Demographics
+        "age", "educ", "married", "kids",
+        # Income sources (many zero-inflated)
+        "income", "wageinc", "ssretinc", "transfothinc", "intdivinc",
+        "bussefarminc", "kginc",
+        # Shared with B
+        "equity", "networth",
+        # Housing
+        "homeeq", "houses",
+        # Vehicles
+        "vehic", "nvehic",
+        # Food spending
+        "foodaway",
     )
-    # Survey B: Wealth + debt components (like PUF/SCF) - 16 columns
+    # Survey B: Wealth + debt components (like PUF/SCF) - 40 columns
     survey_b_cols: Tuple[str, ...] = (
-        "bussefarminc", "intdivinc",  # Shared income
-        "asset", "networth", "debt",  # Summary wealth
-        "fin", "nfin", "houses", "stocks", "checking",  # Asset components
-        "thrift", "cashli", "bond",  # More assets
-        "ccbal", "mrthel", "veh_inst", "edn_inst",  # Debt components
+        # Shared with A
+        "equity", "networth", "homeeq", "wageinc",
+        # Summary wealth
+        "asset", "debt", "fin", "nfin",
+        # Liquid assets
+        "liq", "checking", "saving", "mma", "cds",
+        # Investment assets (zero-inflated)
+        "stocks", "stmutf", "bond", "savbnd", "nmmf",
+        # Retirement (zero-inflated)
+        "retqliq", "reteq", "thrift", "irakh",
+        # Other assets (highly zero-inflated)
+        "cashli", "othma", "othfin",
+        # Real assets
+        "vehic", "houses", "oresre", "nnresre", "bus",
+        # Debt components (zero-inflated)
+        "mrthel", "resdbt", "ccbal", "install",
+        "veh_inst", "edn_inst", "oth_inst", "othloc",
+        # Payments
+        "tpay",
     )
 
     # Shared column(s) that appear in both surveys
-    shared_cols: Tuple[str, ...] = ("bussefarminc", "intdivinc")
+    shared_cols: Tuple[str, ...] = ("equity", "networth", "homeeq", "wageinc", "vehic", "houses")
 
     # Sampling
     sample_frac_a: float = 0.5  # Fraction of population in survey A
@@ -155,32 +179,70 @@ def load_scf(year: int = 2022, seed: int = 42) -> pd.DataFrame:
 
         # Income sources
         "INCOME": "income",       # Total income
-        "WAGEINC": "wageinc",     # Wage and salary income
+        "WAGEINC": "wageinc",     # Wage and salary income (30% zeros)
         "SSRETINC": "ssretinc",   # Social Security income
         "TRANSFOTHINC": "transfothinc",  # Other transfer income
         "INTDIVINC": "intdivinc", # Interest/dividend income
         "BUSSEFARMINC": "bussefarminc",  # Business/farm income
+        "KGINC": "kginc",         # Capital gains income
 
         # Wealth summary
         "ASSET": "asset",         # Total assets
         "NETWORTH": "networth",   # Net worth
-        "DEBT": "debt",           # Total debt
+        "DEBT": "debt",           # Total debt (27% zeros)
         "FIN": "fin",             # Financial assets
         "NFIN": "nfin",           # Non-financial assets
+        "EQUITY": "equity",       # Total equity (37% zeros)
+        "HOMEEQ": "homeeq",       # Home equity (32% zeros)
 
-        # Asset components
-        "HOUSES": "houses",       # Primary residence value
-        "STOCKS": "stocks",       # Direct stock holdings
-        "CHECKING": "checking",   # Checking account balance
-        "THRIFT": "thrift",       # Thrift/retirement accounts
-        "CASHLI": "cashli",       # Cash value life insurance
-        "BOND": "bond",           # Bond holdings
+        # Liquid assets
+        "LIQ": "liq",             # Liquid assets
+        "CHECKING": "checking",   # Checking account (12% zeros)
+        "SAVING": "saving",       # Savings accounts
+        "MMA": "mma",             # Money market accounts (80% zeros)
+        "CDS": "cds",             # Certificates of deposit (92% zeros)
+
+        # Investment assets (highly zero-inflated)
+        "STOCKS": "stocks",       # Direct stock holdings (71% zeros)
+        "STMUTF": "stmutf",       # Stock mutual funds (82% zeros)
+        "BOND": "bond",           # Bond holdings (95% zeros)
+        "SAVBND": "savbnd",       # Savings bonds (91% zeros)
+        "NMMF": "nmmf",           # Non-money market funds (80% zeros)
+
+        # Retirement (zero-inflated)
+        "RETQLIQ": "retqliq",     # Quasi-liquid retirement (41% zeros)
+        "RETEQ": "reteq",         # Retirement equity (45% zeros)
+        "THRIFT": "thrift",       # Thrift/retirement accounts (66% zeros)
+        "IRAKH": "irakh",         # IRA/Keogh accounts (66% zeros)
+
+        # Other assets
+        "CASHLI": "cashli",       # Cash value life insurance (79% zeros)
+        "OTHMA": "othma",         # Other managed assets
+        "OTHFIN": "othfin",       # Other financial assets
+
+        # Real assets
+        "VEHIC": "vehic",         # Vehicles (14% zeros)
+        "NVEHIC": "nvehic",       # Number of vehicles
+        "HOUSES": "houses",       # Primary residence (32% zeros)
+        "ORESRE": "oresre",       # Other residential real estate (76% zeros)
+        "NNRESRE": "nnresre",     # Non-residential real estate (90% zeros)
+        "BUS": "bus",             # Business interests (74% zeros)
 
         # Debt components
-        "CCBAL": "ccbal",         # Credit card balance
-        "MRTHEL": "mrthel",       # Mortgage on primary residence
-        "VEH_INST": "veh_inst",   # Vehicle loans
-        "EDN_INST": "edn_inst",   # Education loans
+        "MRTHEL": "mrthel",       # Mortgage/HELOC (62% zeros)
+        "RESDBT": "resdbt",       # Residential debt
+        "CCBAL": "ccbal",         # Credit card balance (62% zeros)
+        "INSTALL": "install",     # Installment loans
+        "VEH_INST": "veh_inst",   # Vehicle loans (70% zeros)
+        "EDN_INST": "edn_inst",   # Education loans (82% zeros)
+        "OTH_INST": "oth_inst",   # Other installment loans (85% zeros)
+        "OTHLOC": "othloc",       # Other lines of credit
+
+        # Payments
+        "TPAY": "tpay",           # Total payments (29% zeros)
+
+        # Spending
+        "FOODAWAY": "foodaway",   # Food away from home (11% zeros)
 
         # Weight
         "WGT": "weight",          # Survey weight
@@ -196,23 +258,37 @@ def load_scf(year: int = 2022, seed: int = 42) -> pd.DataFrame:
     df = df[list(selected.keys())].rename(columns=selected)
 
     # Clean: replace negative values with 0 for wealth/income variables
-    wealth_cols = [
-        "asset", "networth", "houses", "stocks", "nfin", "fin",
-        "checking", "thrift", "cashli", "bond",
+    # All monetary variables should be non-negative
+    monetary_cols = [
+        # Wealth summary
+        "asset", "networth", "fin", "nfin", "equity", "homeeq",
+        # Liquid assets
+        "liq", "checking", "saving", "mma", "cds",
+        # Investments
+        "stocks", "stmutf", "bond", "savbnd", "nmmf",
+        # Retirement
+        "retqliq", "reteq", "thrift", "irakh",
+        # Other assets
+        "cashli", "othma", "othfin",
+        # Real assets
+        "vehic", "houses", "oresre", "nnresre", "bus",
+        # Income
+        "income", "wageinc", "ssretinc", "transfothinc", "intdivinc",
+        "bussefarminc", "kginc",
+        # Debt
+        "debt", "mrthel", "resdbt", "ccbal", "install",
+        "veh_inst", "edn_inst", "oth_inst", "othloc",
+        # Payments/spending
+        "tpay", "foodaway",
     ]
-    income_cols = [
-        "income", "wageinc", "ssretinc", "transfothinc", "intdivinc", "bussefarminc",
-    ]
-    debt_cols = ["debt", "ccbal", "mrthel", "veh_inst", "edn_inst"]
 
-    for col in wealth_cols + income_cols + debt_cols:
+    for col in monetary_cols:
         if col in df.columns:
             df[col] = df[col].clip(lower=0)
 
-    # Log-transform skewed variables for better GAN training
-    # (skip log transform for small-magnitude variables like demographics)
-    log_transform_cols = wealth_cols + income_cols + debt_cols
-    for col in log_transform_cols:
+    # Log-transform skewed monetary variables for better modeling
+    # (skip for count/categorical variables like nvehic, educ)
+    for col in monetary_cols:
         if col in df.columns:
             df[f"{col}_log"] = np.log1p(df[col])
 
@@ -606,7 +682,3 @@ def plot_coverage_distribution(
 if __name__ == "__main__":
     # Run with default config
     results = run_benchmark()
-
-    # Save figure
-    fig = plot_correlation_recovery(results, save_path="correlation_recovery.png")
-    plt.show()

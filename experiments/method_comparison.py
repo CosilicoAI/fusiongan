@@ -102,10 +102,14 @@ def run_qrf_imputation(
 ) -> MethodResult:
     """QRF: Impute missing columns using Quantile Random Forests.
 
-    Strategy:
-    1. For survey_a records, impute survey_b-only columns
-    2. For survey_b records, impute survey_a-only columns
-    3. Combine into complete records
+    OLD strategy (data fusion, not synthesis):
+    - Keep original rows, impute missing columns
+    - Problem: 100% coverage because we keep real rows!
+
+    NEW strategy (true synthesis):
+    1. Sample new shared variable values (bootstrap from combined surveys)
+    2. Use QRF to predict ALL columns from shared variables
+    3. Result: completely new synthetic rows
     """
     try:
         from quantile_forest import RandomForestQuantileRegressor
@@ -117,26 +121,43 @@ def run_qrf_imputation(
     a_only_cols = [c for c in config.survey_a_cols if c not in shared_cols]
     b_only_cols = [c for c in config.survey_b_cols if c not in shared_cols]
 
-    survey_a_complete = survey_a.copy()
-    survey_b_complete = survey_b.copy()
+    # Combine shared columns from both surveys for sampling
+    shared_a = survey_a[shared_cols].copy()
+    shared_b = survey_b[shared_cols].copy()
+    shared_combined = pd.concat([shared_a, shared_b], ignore_index=True)
 
-    # Impute B columns onto A records (one column at a time)
-    for col in b_only_cols:
-        qrf = RandomForestQuantileRegressor(n_estimators=100, random_state=42, n_jobs=-1)
-        qrf.fit(survey_b[shared_cols].values, survey_b[col].values)
-        # Predict median (quantile 0.5)
-        preds = qrf.predict(survey_a[shared_cols].values, quantiles=0.5)
-        survey_a_complete[col] = preds
+    # Bootstrap sample new shared variable combinations
+    rng = np.random.RandomState(config.seed)
+    n_synthetic = len(survey_a) + len(survey_b)
+    sample_idx = rng.choice(len(shared_combined), size=n_synthetic, replace=True)
 
-    # Impute A columns onto B records
+    # Add small noise to break exact matches with original records
+    sampled_shared = shared_combined.iloc[sample_idx].values.copy()
+    noise_scale = 0.1  # Small noise relative to standardized data
+    sampled_shared += rng.normal(0, noise_scale, sampled_shared.shape)
+
+    synthetic = pd.DataFrame(sampled_shared, columns=shared_cols)
+
+    # Train QRF models to predict each column from shared variables
+    # Use stochastic quantile sampling for diversity
+    quantiles_to_sample = [0.1, 0.25, 0.5, 0.75, 0.9]
+
+    # Predict A-only columns (train on survey A)
     for col in a_only_cols:
         qrf = RandomForestQuantileRegressor(n_estimators=100, random_state=42, n_jobs=-1)
         qrf.fit(survey_a[shared_cols].values, survey_a[col].values)
-        preds = qrf.predict(survey_b[shared_cols].values, quantiles=0.5)
-        survey_b_complete[col] = preds
+        # Sample random quantile per record for diversity
+        all_preds = qrf.predict(sampled_shared, quantiles=quantiles_to_sample)
+        quantile_choices = rng.choice(len(quantiles_to_sample), size=n_synthetic)
+        synthetic[col] = all_preds[np.arange(n_synthetic), quantile_choices]
 
-    # Combine
-    synthetic = pd.concat([survey_a_complete, survey_b_complete], ignore_index=True)
+    # Predict B-only columns (train on survey B)
+    for col in b_only_cols:
+        qrf = RandomForestQuantileRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+        qrf.fit(survey_b[shared_cols].values, survey_b[col].values)
+        all_preds = qrf.predict(sampled_shared, quantiles=quantiles_to_sample)
+        quantile_choices = rng.choice(len(quantiles_to_sample), size=n_synthetic)
+        synthetic[col] = all_preds[np.arange(n_synthetic), quantile_choices]
 
     prdc = compute_prdc(
         holdout_full[all_cols].values,
@@ -162,8 +183,12 @@ def run_zero_inflated_qrf(
 ) -> MethodResult:
     """Zero-inflated QRF: Two-stage model for zero-heavy variables.
 
-    Stage 1: Classify zero vs non-zero
-    Stage 2: QRF on non-zero values only
+    TRUE SYNTHESIS approach:
+    1. Sample new shared variable values (bootstrap + noise)
+    2. For each column, use two-stage model:
+       - Stage 1: Classify zero vs non-zero (probabilistic)
+       - Stage 2: QRF on non-zero values with quantile sampling
+    3. Result: completely new synthetic rows
 
     Note: Data is standardized, so we detect zeros by finding the minimum
     (which corresponds to original zero after (0 - mean) / std transformation).
@@ -180,91 +205,95 @@ def run_zero_inflated_qrf(
     a_only_cols = [c for c in config.survey_a_cols if c not in shared_cols]
     b_only_cols = [c for c in config.survey_b_cols if c not in shared_cols]
 
-    survey_a_complete = survey_a.copy()
-    survey_b_complete = survey_b.copy()
+    # Combine shared columns from both surveys for sampling
+    shared_a = survey_a[shared_cols].copy()
+    shared_b = survey_b[shared_cols].copy()
+    shared_combined = pd.concat([shared_a, shared_b], ignore_index=True)
 
-    def impute_zero_inflated_col(X_train, y_train, X_pred, zero_inflation_threshold=0.1):
-        """Two-stage zero-inflated imputation for a single column.
+    # Bootstrap sample new shared variable combinations
+    rng = np.random.RandomState(config.seed)
+    n_synthetic = len(survey_a) + len(survey_b)
+    sample_idx = rng.choice(len(shared_combined), size=n_synthetic, replace=True)
 
-        Since data is standardized, we detect zeros by:
-        1. Finding the minimum value (which corresponds to original zeros)
-        2. Checking if enough records have that minimum value (zero-inflated)
-        """
-        results = np.zeros(len(X_pred))
+    # Add small noise to break exact matches with original records
+    sampled_shared = shared_combined.iloc[sample_idx].values.copy()
+    noise_scale = 0.1
+    sampled_shared += rng.normal(0, noise_scale, sampled_shared.shape)
 
-        # Detect zeros in standardized data:
-        # Original zeros become the minimum value after standardization
+    synthetic = pd.DataFrame(sampled_shared, columns=shared_cols)
+    quantiles_to_sample = [0.1, 0.25, 0.5, 0.75, 0.9]
+
+    def synthesize_zero_inflated_col(X_train, y_train, X_synth, rng, zero_inflation_threshold=0.1):
+        """Two-stage zero-inflated synthesis for a single column."""
+        n = len(X_synth)
+        results = np.zeros(n)
+
+        # Detect zeros in standardized data
         min_val = y_train.min()
-        # Check if this is truly zero-inflated (many values at minimum)
         at_min = np.isclose(y_train, min_val, atol=1e-6)
         zero_frac = at_min.sum() / len(y_train)
 
         if zero_frac < zero_inflation_threshold:
-            # Not zero-inflated enough, use standard QRF
+            # Not zero-inflated, use standard QRF with quantile sampling
             qrf = RandomForestQuantileRegressor(n_estimators=100, random_state=42, n_jobs=-1)
             qrf.fit(X_train, y_train)
-            return qrf.predict(X_pred, quantiles=0.5).flatten()
+            all_preds = qrf.predict(X_synth, quantiles=quantiles_to_sample)
+            quantile_choices = rng.choice(len(quantiles_to_sample), size=n)
+            return all_preds[np.arange(n), quantile_choices], False
 
         # Zero-inflated: use two-stage model
         is_nonzero = (~at_min).astype(int)
 
         if is_nonzero.sum() < 10:
-            # Too few non-zero, predict all at minimum (zeros)
-            return np.full(len(X_pred), min_val)
+            return np.full(n, min_val), True
 
-        # Stage 1: Classify zero vs non-zero
+        # Stage 1: Classify zero vs non-zero (use probabilities for stochastic sampling)
         clf = RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=-1)
         clf.fit(X_train, is_nonzero)
-        pred_nonzero = clf.predict(X_pred)
+        probs = clf.predict_proba(X_synth)[:, 1]  # P(non-zero)
+        pred_nonzero = rng.random(n) < probs  # Stochastic classification
 
         # Stage 2: QRF on non-zero values
         nonzero_mask = ~at_min
         results.fill(min_val)  # Default to standardized zero
 
-        if nonzero_mask.sum() > 10:
+        if nonzero_mask.sum() > 10 and pred_nonzero.sum() > 0:
             qrf = RandomForestQuantileRegressor(n_estimators=100, random_state=42, n_jobs=-1)
             qrf.fit(X_train[nonzero_mask], y_train[nonzero_mask])
-            # Predict for records classified as non-zero
-            pred_mask = pred_nonzero == 1
-            if pred_mask.sum() > 0:
-                qrf_preds = qrf.predict(X_pred[pred_mask], quantiles=0.5)
-                results[pred_mask] = qrf_preds.flatten()
+            # Predict with quantile sampling for diversity
+            all_preds = qrf.predict(X_synth[pred_nonzero], quantiles=quantiles_to_sample)
+            quantile_choices = rng.choice(len(quantiles_to_sample), size=pred_nonzero.sum())
+            results[pred_nonzero] = all_preds[np.arange(pred_nonzero.sum()), quantile_choices]
 
-        return results
+        return results, True
 
     zero_inflated_count = 0
 
-    # Impute B columns onto A records
-    for col in b_only_cols:
-        preds = impute_zero_inflated_col(
-            survey_b[shared_cols].values,
-            survey_b[col].values,
-            survey_a[shared_cols].values,
-        )
-        # Track if this column was treated as zero-inflated
-        min_val = survey_b[col].values.min()
-        at_min = np.isclose(survey_b[col].values, min_val, atol=1e-6)
-        if at_min.sum() / len(survey_b) >= 0.1:
-            zero_inflated_count += 1
-        survey_a_complete[col] = preds
-
-    # Impute A columns onto B records
+    # Synthesize A-only columns (train on survey A)
     for col in a_only_cols:
-        preds = impute_zero_inflated_col(
+        preds, is_zi = synthesize_zero_inflated_col(
             survey_a[shared_cols].values,
             survey_a[col].values,
-            survey_b[shared_cols].values,
+            sampled_shared,
+            rng,
         )
-        min_val = survey_a[col].values.min()
-        at_min = np.isclose(survey_a[col].values, min_val, atol=1e-6)
-        if at_min.sum() / len(survey_a) >= 0.1:
+        if is_zi:
             zero_inflated_count += 1
-        survey_b_complete[col] = preds
+        synthetic[col] = preds
+
+    # Synthesize B-only columns (train on survey B)
+    for col in b_only_cols:
+        preds, is_zi = synthesize_zero_inflated_col(
+            survey_b[shared_cols].values,
+            survey_b[col].values,
+            sampled_shared,
+            rng,
+        )
+        if is_zi:
+            zero_inflated_count += 1
+        synthetic[col] = preds
 
     print(f"  (ZI-QRF used two-stage model for {zero_inflated_count} zero-inflated columns)")
-
-    # Combine
-    synthetic = pd.concat([survey_a_complete, survey_b_complete], ignore_index=True)
 
     prdc = compute_prdc(
         holdout_full[all_cols].values,

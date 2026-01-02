@@ -229,74 +229,76 @@ def create_artificial_surveys(
     return survey_a, survey_b, holdout
 
 
-def compute_cross_survey_correlation(
-    df: pd.DataFrame,
-    col_a: str,
-    col_b: str,
-) -> float:
-    """Compute correlation between two columns.
-
-    Args:
-        df: DataFrame containing both columns.
-        col_a: First column (originally from survey A only).
-        col_b: Second column (originally from survey B only).
-
-    Returns:
-        Pearson correlation coefficient.
-    """
-    valid_mask = df[col_a].notna() & df[col_b].notna()
-    if valid_mask.sum() < 2:
-        return np.nan
-    return np.corrcoef(df.loc[valid_mask, col_a], df.loc[valid_mask, col_b])[0, 1]
-
-
-def compute_all_cross_correlations(
+def compute_record_realism_metrics(
     synthetic: pd.DataFrame,
     holdout: pd.DataFrame,
-    survey_a_cols: List[str],
-    survey_b_cols: List[str],
-    shared_cols: List[str],
-) -> Dict[str, Dict[str, float]]:
-    """Compute all cross-survey correlations.
+    k: int = 5,
+) -> Dict[str, float]:
+    """Compute record-level realism metrics.
+
+    These metrics evaluate whether synthetic records look like they could
+    have come from the real population. Aggregate statistics (correlations,
+    totals) are handled separately by calibration.
 
     Args:
         synthetic: Generated synthetic data.
         holdout: Held-out ground truth.
-        survey_a_cols: Columns unique to survey A.
-        survey_b_cols: Columns unique to survey B.
-        shared_cols: Columns in both surveys.
+        k: Number of neighbors for k-NN metrics.
 
     Returns:
-        Dict with correlation comparisons.
+        Dict with:
+            - coverage: Mean distance from holdout to nearest synthetic
+                       (lower = synthetic covers real distribution)
+            - authenticity: Mean distance from synthetic to nearest holdout
+                           (lower = synthetic records look real, not mode-collapsed)
+            - density_ratio: Ratio of authenticity to coverage
+                            (close to 1.0 = balanced quality)
     """
-    # Find unique columns (not in both surveys)
-    a_unique = [c for c in survey_a_cols if c not in shared_cols]
-    b_unique = [c for c in survey_b_cols if c not in shared_cols]
+    from sklearn.neighbors import NearestNeighbors
 
-    results = {}
-    for col_a in a_unique:
-        for col_b in b_unique:
-            if col_a in synthetic.columns and col_b in synthetic.columns:
-                key = f"{col_a}_vs_{col_b}"
-                results[key] = {
-                    "true": compute_cross_survey_correlation(holdout, col_a, col_b),
-                    "synthetic": compute_cross_survey_correlation(synthetic, col_a, col_b),
-                }
+    # Align columns
+    common_cols = list(set(synthetic.columns) & set(holdout.columns))
+    synth_vals = synthetic[common_cols].values
+    hold_vals = holdout[common_cols].values
 
-    return results
+    # Coverage: for each holdout record, find distance to nearest synthetic
+    nn_synth = NearestNeighbors(n_neighbors=min(k, len(synth_vals)), metric="euclidean")
+    nn_synth.fit(synth_vals)
+    distances_to_synth, _ = nn_synth.kneighbors(hold_vals)
+    coverage = distances_to_synth[:, 0].mean()  # Distance to nearest
+
+    # Authenticity: for each synthetic record, find distance to nearest holdout
+    nn_hold = NearestNeighbors(n_neighbors=min(k, len(hold_vals)), metric="euclidean")
+    nn_hold.fit(hold_vals)
+    distances_to_hold, _ = nn_hold.kneighbors(synth_vals)
+    authenticity = distances_to_hold[:, 0].mean()  # Distance to nearest
+
+    # Density ratio: balanced if close to 1.0
+    density_ratio = authenticity / (coverage + 1e-8)
+
+    return {
+        "coverage": coverage,
+        "authenticity": authenticity,
+        "density_ratio": density_ratio,
+    }
 
 
 @dataclass
 class BenchmarkResults:
-    """Results from SCF benchmark experiment."""
+    """Results from SCF benchmark experiment.
 
-    # Per-source metrics
-    coverage: Dict[str, float]
-    discriminator_accuracy: Dict[str, float]
+    Focus is on record-level realism, not aggregate statistics.
+    Correlations and totals are handled by calibration downstream.
+    """
 
-    # Cross-survey correlation recovery
-    correlations: Dict[str, Dict[str, float]]
-    correlation_rmse: float
+    # Per-source metrics (projected to each survey's columns)
+    per_source_coverage: Dict[str, float]
+    per_source_disc_acc: Dict[str, float]
+
+    # Full-record realism (comparing complete synthetic to holdout)
+    coverage: float          # Mean NN dist from holdout → synthetic
+    authenticity: float      # Mean NN dist from synthetic → holdout
+    density_ratio: float     # authenticity / coverage (ideal ≈ 1.0)
 
     # Data sizes
     n_survey_a: int
@@ -308,31 +310,25 @@ class BenchmarkResults:
         """Return human-readable summary."""
         lines = [
             "SCF Benchmark Results",
-            "=" * 40,
+            "=" * 50,
             f"Survey A: {self.n_survey_a:,} records",
             f"Survey B: {self.n_survey_b:,} records",
-            f"Holdout: {self.n_holdout:,} records",
+            f"Holdout: {self.n_holdout:,} records (ground truth)",
             f"Synthetic: {self.n_synthetic:,} records",
             "",
-            "Per-Source Metrics:",
+            "Record-Level Realism (lower distance = better):",
+            f"  Coverage:     {self.coverage:.4f}  (holdout → synth)",
+            f"  Authenticity: {self.authenticity:.4f}  (synth → holdout)",
+            f"  Density Ratio: {self.density_ratio:.2f}  (ideal ≈ 1.0)",
+            "",
+            "Per-Source Discriminator Accuracy (ideal = 50%):",
         ]
 
-        for source in self.coverage:
-            lines.append(
-                f"  {source}: coverage={self.coverage[source]:.4f}, "
-                f"disc_acc={self.discriminator_accuracy[source]:.1%}"
-            )
-
-        lines.extend([
-            "",
-            "Cross-Survey Correlation Recovery:",
-            f"  Overall RMSE: {self.correlation_rmse:.4f}",
-        ])
-
-        for key, vals in self.correlations.items():
-            lines.append(
-                f"  {key}: true={vals['true']:.3f}, synth={vals['synthetic']:.3f}"
-            )
+        for source in self.per_source_disc_acc:
+            acc = self.per_source_disc_acc[source]
+            # 50% = generator fools discriminator completely
+            quality = "✓" if 0.45 <= acc <= 0.55 else "○" if 0.4 <= acc <= 0.6 else "✗"
+            lines.append(f"  {source}: {acc:.1%} {quality}")
 
         return "\n".join(lines)
 
@@ -383,37 +379,29 @@ def run_benchmark(config: Optional[SCFBenchmarkConfig] = None) -> BenchmarkResul
     print(f"Generating {n_synthetic:,} synthetic records...")
     synthetic = synth.generate(n=n_synthetic, seed=config.seed)
 
-    # Evaluate per-source metrics
-    print("Evaluating...")
+    # Evaluate per-source metrics (projected to each survey's columns)
+    print("Evaluating record-level realism...")
     eval_metrics = synth.evaluate()
-    coverage = {k: v["coverage"] for k, v in eval_metrics.items()}
-    disc_acc = {k: v["discriminator_accuracy"] for k, v in eval_metrics.items()}
+    per_source_coverage = {k: v["coverage"] for k, v in eval_metrics.items()}
+    per_source_disc_acc = {k: v["discriminator_accuracy"] for k, v in eval_metrics.items()}
 
-    # Evaluate cross-survey correlations
+    # Evaluate full-record realism against holdout
+    # This is the key metric: do complete synthetic records look real?
     all_cols = list(set(config.survey_a_cols) | set(config.survey_b_cols))
     holdout_subset = holdout[all_cols]
 
-    correlations = compute_all_cross_correlations(
+    realism_metrics = compute_record_realism_metrics(
         synthetic=synthetic,
         holdout=holdout_subset,
-        survey_a_cols=list(config.survey_a_cols),
-        survey_b_cols=list(config.survey_b_cols),
-        shared_cols=list(config.shared_cols),
+        k=5,
     )
 
-    # Compute correlation RMSE
-    corr_errors = []
-    for key, vals in correlations.items():
-        if not np.isnan(vals["true"]) and not np.isnan(vals["synthetic"]):
-            corr_errors.append((vals["true"] - vals["synthetic"]) ** 2)
-
-    correlation_rmse = np.sqrt(np.mean(corr_errors)) if corr_errors else np.nan
-
     results = BenchmarkResults(
-        coverage=coverage,
-        discriminator_accuracy=disc_acc,
-        correlations=correlations,
-        correlation_rmse=correlation_rmse,
+        per_source_coverage=per_source_coverage,
+        per_source_disc_acc=per_source_disc_acc,
+        coverage=realism_metrics["coverage"],
+        authenticity=realism_metrics["authenticity"],
+        density_ratio=realism_metrics["density_ratio"],
         n_survey_a=len(survey_a),
         n_survey_b=len(survey_b),
         n_holdout=len(holdout),
@@ -424,53 +412,83 @@ def run_benchmark(config: Optional[SCFBenchmarkConfig] = None) -> BenchmarkResul
     return results
 
 
-def plot_correlation_recovery(
-    results: BenchmarkResults,
-    save_path: Optional[str] = None,
-) -> plt.Figure:
-    """Plot true vs recovered correlations.
+def compute_nn_distances(
+    synthetic: pd.DataFrame,
+    holdout: pd.DataFrame,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute nearest-neighbor distances for coverage analysis.
 
     Args:
-        results: Benchmark results.
+        synthetic: Generated synthetic data.
+        holdout: Held-out ground truth.
+
+    Returns:
+        Tuple of (holdout_to_synth_distances, synth_to_holdout_distances)
+    """
+    from sklearn.neighbors import NearestNeighbors
+
+    common_cols = list(set(synthetic.columns) & set(holdout.columns))
+    synth_vals = synthetic[common_cols].values
+    hold_vals = holdout[common_cols].values
+
+    # Distance from each holdout record to nearest synthetic
+    nn_synth = NearestNeighbors(n_neighbors=1, metric="euclidean")
+    nn_synth.fit(synth_vals)
+    hold_to_synth, _ = nn_synth.kneighbors(hold_vals)
+
+    # Distance from each synthetic record to nearest holdout
+    nn_hold = NearestNeighbors(n_neighbors=1, metric="euclidean")
+    nn_hold.fit(hold_vals)
+    synth_to_hold, _ = nn_hold.kneighbors(synth_vals)
+
+    return hold_to_synth.flatten(), synth_to_hold.flatten()
+
+
+def plot_coverage_distribution(
+    synthetic: pd.DataFrame,
+    holdout: pd.DataFrame,
+    save_path: Optional[str] = None,
+) -> plt.Figure:
+    """Plot distribution of nearest-neighbor distances.
+
+    Shows how well synthetic data covers the real population.
+    Lower distances = better coverage.
+
+    Args:
+        synthetic: Generated synthetic data.
+        holdout: Held-out ground truth.
         save_path: Optional path to save figure.
 
     Returns:
         Matplotlib figure.
     """
-    true_corrs = []
-    synth_corrs = []
-    labels = []
+    hold_to_synth, synth_to_hold = compute_nn_distances(synthetic, holdout)
 
-    for key, vals in results.correlations.items():
-        if not np.isnan(vals["true"]) and not np.isnan(vals["synthetic"]):
-            true_corrs.append(vals["true"])
-            synth_corrs.append(vals["synthetic"])
-            labels.append(key.replace("_vs_", "\nvs\n"))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    # Coverage: holdout → synthetic (primary metric)
+    ax1 = axes[0]
+    ax1.hist(hold_to_synth, bins=50, color="#00d4ff", alpha=0.7, edgecolor="white")
+    ax1.axvline(np.mean(hold_to_synth), color="red", linestyle="--",
+                label=f"Mean: {np.mean(hold_to_synth):.3f}")
+    ax1.axvline(np.median(hold_to_synth), color="orange", linestyle="--",
+                label=f"Median: {np.median(hold_to_synth):.3f}")
+    ax1.set_xlabel("Distance to Nearest Synthetic", fontsize=11)
+    ax1.set_ylabel("Count (Holdout Records)", fontsize=11)
+    ax1.set_title("Coverage: Holdout → Synthetic\n(Every real person has a similar synthetic)", fontsize=12)
+    ax1.legend()
 
-    # Scatter plot
-    ax.scatter(true_corrs, synth_corrs, s=100, alpha=0.7, c="#00d4ff", edgecolors="white")
-
-    # Perfect recovery line
-    lims = [min(min(true_corrs), min(synth_corrs)) - 0.1,
-            max(max(true_corrs), max(synth_corrs)) + 0.1]
-    ax.plot(lims, lims, "k--", alpha=0.5, label="Perfect recovery")
-
-    # Labels
-    for i, label in enumerate(labels):
-        ax.annotate(label, (true_corrs[i], synth_corrs[i]),
-                   textcoords="offset points", xytext=(10, 10),
-                   fontsize=8, alpha=0.8)
-
-    ax.set_xlabel("True Correlation (Holdout)", fontsize=12)
-    ax.set_ylabel("Recovered Correlation (Synthetic)", fontsize=12)
-    ax.set_title(f"Cross-Survey Correlation Recovery\n(RMSE: {results.correlation_rmse:.4f})",
-                fontsize=14)
-    ax.set_xlim(lims)
-    ax.set_ylim(lims)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    # Authenticity: synthetic → holdout
+    ax2 = axes[1]
+    ax2.hist(synth_to_hold, bins=50, color="#7b2cbf", alpha=0.7, edgecolor="white")
+    ax2.axvline(np.mean(synth_to_hold), color="red", linestyle="--",
+                label=f"Mean: {np.mean(synth_to_hold):.3f}")
+    ax2.axvline(np.median(synth_to_hold), color="orange", linestyle="--",
+                label=f"Median: {np.median(synth_to_hold):.3f}")
+    ax2.set_xlabel("Distance to Nearest Holdout", fontsize=11)
+    ax2.set_ylabel("Count (Synthetic Records)", fontsize=11)
+    ax2.set_title("Authenticity: Synthetic → Holdout\n(Synthetic records look real)", fontsize=12)
+    ax2.legend()
 
     plt.tight_layout()
 
